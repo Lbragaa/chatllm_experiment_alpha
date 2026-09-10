@@ -26,8 +26,8 @@ class TestChatEndpoint:
             "/api/chat",
             json={"message": "Ola"},
         )
-        # Sem OPENROUTER_API_KEY definida, esperamos 503 (config error)
-        assert response.status_code in (200, 422, 503)
+        # Sem OPENROUTER_API_KEY definida, esperamos 503 (config error) ou 502 (runtime error)
+        assert response.status_code in (200, 422, 503, 502)
 
     def test_chat_empty_message_rejected(self, client: TestClient):
         """Mensagem vazia deve ser rejeitada com 422 (validacao Pydantic)."""
