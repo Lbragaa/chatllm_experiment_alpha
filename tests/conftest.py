@@ -4,64 +4,39 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
-from backend.database import Base, get_db
-from backend.main import app
+from backend.main import create_app
+from backend.migrations import initialize_database
 
 
-@pytest.fixture(scope="session")
-def engine():
-    """Cria um engine SQLite em memoria para os testes."""
-    return create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+@pytest.fixture
+def engine(tmp_path):
+    test_engine = create_engine(
+        f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
+        connect_args={"check_same_thread": False}, poolclass=NullPool,
     )
-
-
-@pytest.fixture(scope="session")
-def tables(engine):
-    """Cria todas as tabelas antes dos testes e as remove ao final."""
-    Base.metadata.create_all(bind=engine)
-    yield
-    Base.metadata.drop_all(bind=engine)
+    initialize_database(test_engine)
+    yield test_engine
+    test_engine.dispose()
 
 
 @pytest.fixture
-def db_session(engine, tables):
-    """Retorna uma sessao de banco limpa para cada teste.
-
-    Usa transacao aninhada (SAVEPOINT) para isolar cada teste.
-    Ao final do teste, o rollback desfaz todas as alteracoes.
-    """
-    connection = engine.connect()
-    transaction = connection.begin()
-
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=connection)
-    session = TestingSessionLocal()
-
-    try:
+def db_session(engine):
+    with sessionmaker(bind=engine)() as session:
         yield session
-    finally:
-        session.close()
-        transaction.rollback()
-        connection.close()
 
 
 @pytest.fixture
-def client(db_session):
-    """Retorna um TestClient do FastAPI com o banco de testes injetado."""
-
-    def _override_get_db():
-        try:
-            yield db_session
-        finally:
-            pass
-
-    app.dependency_overrides[get_db] = _override_get_db
-
-    with TestClient(app) as test_client:
+def client(engine):
+    # Production dependencies/lifecycle, isolated database. No shared transactions.
+    with TestClient(create_app(engine)) as test_client:
         yield test_client
 
-    app.dependency_overrides.clear()
+
+@pytest.fixture
+def fresh_db(engine):
+    # Reopen the file with a different engine and independent physical connections.
+    independent_engine = create_engine(engine.url, poolclass=NullPool)
+    yield sessionmaker(bind=independent_engine)
+    independent_engine.dispose()

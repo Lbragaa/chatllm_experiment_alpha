@@ -4,8 +4,12 @@ __pycache__/
 .venv/
 venv/
 database/*.db
+database/*.sqlite
+database/*.db-*
 
 node_modules/
+.test-tmp-*/
+.pytest_cache/
 
 .DS_Store
 Thumbs.db

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from hashlib import sha256
+
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
-from backend.models import User, Session as DbSession
+from backend.models import User, AuthSession as DbSession
 from backend.schemas.auth import AuthResponse, LoginRequest, RegisterRequest, UserMeResponse
 from backend.services.auth import (
     create_jwt_token,
@@ -21,10 +23,10 @@ def _normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def _get_current_user(
+def _get_auth_session(
     authorization: str | None = Header(None),
     db: Session = Depends(get_db),
-) -> User:
+) -> DbSession:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token nao fornecido")
 
@@ -33,12 +35,29 @@ def _get_current_user(
     if payload is None:
         raise HTTPException(status_code=401, detail="Token invalido ou expirado")
 
-    user_id = int(payload["sub"])
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuario nao encontrado")
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Token invalido")
+    session = db.query(DbSession).filter(
+        DbSession.token == sha256(token.encode()).hexdigest(),
+        DbSession.user_id == user_id,
+        DbSession.is_active.is_(True),
+    ).first()
+    if session is None or session.user is None:
+        raise HTTPException(status_code=401, detail="Sessao invalida ou encerrada")
+    return session
 
-    return user
+
+def _get_current_user(session: DbSession = Depends(_get_auth_session)) -> User:
+    return session.user
+
+
+def _issue_session(user: User, db: Session) -> AuthResponse:
+    token = create_jwt_token(user.id, user.email)
+    db.add(DbSession(token=sha256(token.encode()).hexdigest(), user_id=user.id))
+    db.commit()
+    return AuthResponse(token=token, email=user.email, user_id=user.id)
 
 
 @router.post("/api/auth/register", response_model=AuthResponse)
@@ -54,11 +73,8 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> AuthRes
 
     user = User(email=email, password_hash=hash_password(payload.password))
     db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    token = create_jwt_token(user.id, user.email)
-    return AuthResponse(token=token, email=user.email, user_id=user.id)
+    db.flush()
+    return _issue_session(user, db)
 
 
 @router.post("/api/auth/login", response_model=AuthResponse)
@@ -69,23 +85,16 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Email ou senha incorretos")
 
-    token = create_jwt_token(user.id, user.email)
-    return AuthResponse(token=token, email=user.email, user_id=user.id)
+    return _issue_session(user, db)
 
 
 @router.post("/api/auth/logout")
 def logout(
-    authorization: str | None = Header(None),
+    session: DbSession = Depends(_get_auth_session),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Token nao fornecido")
-
-    token = authorization.removeprefix("Bearer ").strip()
-    payload = decode_jwt_token(token)
-    if payload is None:
-        raise HTTPException(status_code=401, detail="Token invalido ou expirado")
-
+    session.is_active = False
+    db.commit()
     return {"message": "Logout realizado com sucesso"}
 
 

@@ -1,42 +1,57 @@
 # Implementation Report
 
-> A concise summary for the reviewer.
+## Estado atual — correções de 12/09/2026
 
-**Reviewer note**: If a PR modifies `.brainsback/<task-folder>/TODO.md` or `.brainsback/<task-folder>/REACTO.md`, assume this is expected and that those files were modified by the human developer.
-If present, use `.github/skills/brainsback-reviewer/SKILL.md` as the review rubric.
+Autenticação e sessões de chat corrigidas após a revisão. A implementação anterior
+de logout somente no cliente foi substituída por revogação persistida no servidor.
 
-## Snapshot
-- **Change**: Implementação de autenticação por email e senha (cadastro, login, logout) com persistência SQLite.
-- **Status**: Completo — 55 testes passando (14 novos de auth + 41 existentes).
+## Alterações
 
-## The Changes
-- [x] **`backend/models.py`** — Adicionados modelos `User` (id, email, password_hash, created_at) e `Session` (id, token, user_id, is_active, created_at) com relacionamento SQLAlchemy.
-- [x] **`backend/schemas/auth.py`** — Schemas Pydantic: `RegisterRequest`, `LoginRequest`, `AuthResponse`, `UserMeResponse`.
-- [x] **`backend/services/auth.py`** — Serviço de autenticação: hash de senha com bcrypt, criação/verificação de JWT tokens (HS256, expiração 7 dias).
-- [x] **`backend/routers/auth.py`** — Endpoints REST:
-  - `POST /api/auth/register` — Cadastro com validação de email único e normalização (lowercase + trim).
-  - `POST /api/auth/login` — Login com verificação de credenciais, retorna JWT.
-  - `POST /api/auth/logout` — Logout (invalidação do token no cliente).
-  - `GET /api/auth/me` — Retorna dados do usuário autenticado via token Bearer.
-- [x] **`backend/config.py`** — Adicionada `SECRET_KEY` (lida de `.env` ou fallback seguro).
-- [x] **`backend/main.py`** — Registrado `auth_router`.
-- [x] **`backend/requirements.txt`** — Adicionados `bcrypt>=4.0` e `PyJWT==2.13.0`.
-- [x] **`frontend/src/api.js`** — Adicionadas funções `registerUser`, `loginUser`, `logoutUser`, `getMe`.
-- [x] **`frontend/src/App.jsx`** — Adicionados `AuthScreen` (tela de login/cadastro com toggle), estado de autenticação com persistência em `localStorage`, verificação de token ao carregar, botão de logout no header.
-- [x] **`frontend/index.html`** — Adicionados estilos CSS para formulário de autenticação, botão de logout e informações do usuário.
-- [x] **`tests/test_auth.py`** — 14 testes cobrindo: cadastro sucesso, email duplicado, email inválido, senha curta, campos vazios, login sucesso, senha errada, usuário inexistente, case-insensitive, `/me` autenticado/sem token/token inválido, logout autenticado/sem token.
+- `backend/routers/auth.py` e `backend/models.py`: cadastro/login registram
+  `AuthSession` com SHA-256 do JWT. A autenticação exige assinatura/expiração válidas,
+  usuário existente e sessão ativa. Logout desativa apenas o token atual no SQLite.
+- `backend/main.py` e `backend/database.py`: fábrica `create_app(engine)`, banco
+  inicializado no lifespan e sessões por requisição. Importar a aplicação não altera
+  o banco; testes injetam seu próprio engine antes da inicialização.
+- `backend/migrations.py`: atualização idempotente do esquema legado, com backup
+  SQLite e arquivamento de mensagens sem proprietário em `chat_messages_legacy`.
+  Usuários e demais dados são preservados; não há `drop_all()` na aplicação.
+- `backend/routers/chat.py`: streaming usa transação independente para salvar
+  título, data e mensagens; o evento `done` é enviado somente após commit.
+  Resposta vazia, conversa removida e falha de persistência geram erro.
+- `frontend/src/App.jsx`: bloqueio imediato de envios duplicados, bloqueio da
+  sidebar durante operações, cancelamento e descarte de callbacks antigos.
+  Logout cancela o streaming e só limpa a autenticação após confirmação do servidor.
+- `frontend/src/api.js`: criação cancelável e detecção de streaming encerrado
+  sem confirmação de salvamento. JWT continua sendo enviado como Bearer.
+- `tests/conftest.py`: SQLite em arquivo temporário por teste, NullPool,
+  dependências reais e engines independentes para comprovar persistência.
+- `DATABASE_UPGRADE.md`: procedimento de atualização, arquivo legado,
+  necessidade de novo login e comportamento de cancelamento.
 
-## Testing Strategy
-- Testes automatizados com `TestClient` do FastAPI e banco SQLite em memória.
-- Cobertura de todos os fluxos: happy path, edge cases (email duplicado, senha curta, email inválido), e segurança (token inválido, credenciais incorretas).
-- 55 testes no total, todos passando.
+## Validação executada
 
-## Risks & Follow-up
-- [x] SECRET_KEY em produção deve ser definida via variável de ambiente, não usar o fallback.
-- [x] Senhas armazenadas com bcrypt (hash + salt) — nunca em texto puro.
-- [x] Email normalizado (lowercase + trim) antes de salvar e comparar.
-- [x] Mensagens de erro genéricas para login ("Email ou senha incorretos") — não revelam se a conta existe.
-- [ ] Token JWT atualmente não tem blacklist — logout é puramente client-side. Para maior segurança, poderia-se usar a tabela `Session` para invalidar tokens no servidor.
+- Python: **86 testes passando**, incluindo os testes existentes e regressões para
+  revogação após reinício, preservação de usuários/mensagens legadas, idempotência,
+  persistência do streaming com nova aplicação/engine e rollback de falha no commit.
+- Node: **6 testes passando**, exercitando os handlers reais do frontend e o
+  transporte SSE com requisições controladas: envio duplicado, troca durante stream,
+  cancelamento, callbacks atrasados, logout e confirmação final de persistência.
+- Exclusão em cascata verificada diretamente na tabela de mensagens.
+- Nenhuma chamada real à OpenRouter é necessária para essas suítes.
+- A execução utilizou bancos temporários; não foi iniciada a aplicação com
+  `database/chat.db` para validar as alterações.
+- Testes Node não renderizam a interface: validação visual no navegador ainda
+  deve ser feita. Há avisos de depreciação das dependências Python.
 
----
-**Note**: Usually filled by the AI.
+## Comportamentos e limites
+
+- Tokens emitidos antes desta atualização exigem novo login; contas são preservadas.
+- Mensagens antigas sem usuário identificado permanecem no arquivo legado e no
+  backup, fora da sidebar. Não se atribui esse histórico arbitrariamente a alguém.
+- Interromper antes do salvamento descarta a resposta parcial; uma conversa vazia
+  pode permanecer. Use Parar antes de trocar de conversa.
+- Bcrypt, JWT HS256 com prazo de sete dias e localStorage permanecem. O fallback
+  fixo de SECRET_KEY não é apropriado para produção; configure um segredo próprio.
+- Os registros históricos de REACTO e revisão socrática não foram reescritos:
+  descrevem a versão anterior, inclusive suas limitações de logout.

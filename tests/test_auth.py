@@ -141,3 +141,32 @@ class TestLogoutEndpoint:
     def test_logout_no_token(self, client: TestClient):
         response = client.post("/api/auth/logout")
         assert response.status_code == 401
+
+    def test_logout_revokes_only_current_token_and_survives_restart(self, client, engine):
+        from backend.main import create_app
+        from sqlalchemy import create_engine
+
+        credentials = {"email": "revoke@example.com", "password": "123456"}
+        token_a = client.post("/api/auth/register", json=credentials).json()["token"]
+        token_b = client.post("/api/auth/login", json=credentials).json()["token"]
+        a = {"Authorization": f"Bearer {token_a}"}
+        b = {"Authorization": f"Bearer {token_b}"}
+        assert client.post("/api/auth/logout", headers=a).status_code == 200
+        # Fresh app and engine using the persisted file, no shared session/connection.
+        reopened = create_engine(engine.url, connect_args={"check_same_thread": False})
+        try:
+            with TestClient(create_app(reopened)) as restarted:
+                assert restarted.get("/api/auth/me", headers=a).status_code == 401
+                assert restarted.get("/api/sessions", headers=a).status_code == 401
+                assert restarted.post("/api/chat/stream", headers=a, json={"message": "Oi"}).status_code == 401
+                assert restarted.get("/api/auth/me", headers=b).status_code == 200
+                assert restarted.post("/api/auth/login", json=credentials).status_code == 200
+        finally:
+            reopened.dispose()
+
+    def test_jwt_without_persisted_auth_session_is_rejected(self, client):
+        from backend.services.auth import create_jwt_token
+        response = client.post("/api/auth/register", json={"email": "old@example.com", "password": "123456"})
+        data = response.json()
+        old_token = create_jwt_token(data["user_id"], data["email"])
+        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {old_token}"}).status_code == 401
